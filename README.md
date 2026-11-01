@@ -67,7 +67,8 @@ node src/index.js --port 8443 --public-host 203.0.113.10
 | `--host <addr>` | `0.0.0.0` | 监听地址 |
 | `--upstream <url>` | `http://127.0.0.1:3299` | DSH 地址（仅支持 http，同机无需加密） |
 | `--data-dir <path>` | `~/.dsh-auth-gateway` | 凭据、会话密钥、证书存放目录 |
-| `--dsh-home <path>` | `$DSH_HOME` 或 `~/.dsh` | 读 DSH cookie 签名密钥的位置（SSO 用） |
+| `--dsh-home <path>` | `$DSH_HOME` 或 `~/.dsh` | 读 DSH 配置的位置（SSO 和模型配置用） |
+| `--profile <name>` | `web` | 要配置的 DSH profile |
 | `--public-host <h>` | 自动探测 | 证书 CN / 日志里展示的地址 |
 | `--cert` / `--key` | `<data-dir>/cert.pem` 等 | 自定义证书 |
 | `--http` | 关 | 明文 HTTP（**密码会明文过网**，仅限本机/可信内网） |
@@ -75,6 +76,52 @@ node src/index.js --port 8443 --public-host 203.0.113.10
 | `--no-sso` | 关 | 不自动签发 DSH cookie |
 
 环境变量：`DSH_GATEWAY_HOME`（等同 `--data-dir`）、`DSH_HOME`（等同 `--dsh-home`）。
+
+## 网页里配模型
+
+登录后，如果 DSH 还没有可用的模型配置，网关会自动把你引到 **`/__gateway/config`**——不用登进 DSH 摸设置菜单，也不用碰命令行。
+
+这个页面上做三件事：
+
+1. 填 **API 地址**（OpenAI 兼容的 Base URL，例如 `https://api.example.com/v1`）和 **API Key**
+2. 点「拉取模型列表」——网关会带着你的 Key 去请求 `<baseURL>/models`
+3. 从下拉里选一个默认模型，点「保存并生效」
+
+保存后**立即生效**，不用重启 DSH：网关写的是 DSH 的 patch 文件，而 DSH 对它有 HMR 监听。
+
+写下去的内容分别落在两个地方：
+
+```yaml
+# ~/.dsh/profiles/web/cordis.patch.yml   ← provider 定义 + 默认模型
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      custom:
+        displayName: 自定义
+        apiKeyEnv: DSH_GW_API_KEY
+        api: openai-completions
+        baseURL: https://api.example.com/v1
+        models:
+          - id: deepseek-v4-1-flash
+            name: deepseek-v4-1-flash
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: custom
+    model: deepseek-v4-1-flash
+```
+
+```yaml
+# ~/.dsh/.credentials.yaml   ← Key 单独存，只追加这一个 ref
+version: 1
+refs:
+  DSH_GW_API_KEY: sk-...
+records:
+  client-connection/browser-session: ...   # 原有内容完整保留，不会掉线
+```
+
+API Key 输入框留空表示「沿用已保存的值」，换模型时不必重输。
 
 ## 部署为 systemd 服务
 
@@ -168,6 +215,17 @@ DSH 侧原有的围栏全部保留并通过实测：伪造 `Host` → 403、`sec
 | `src/credentials.js` | scrypt 密码存储、首设、校验、改密 |
 | `src/session.js` | 网关自己的 HMAC 签名 cookie |
 | `src/dsh-session.js` | 读 DSH 签名密钥，代签 DSH 会话 cookie（SSO） |
+| `src/dsh-config.js` | 写 DSH 的 provider / Key / 默认模型，拉取上游模型列表 |
+| `src/config-page.js` | 模型配置页（单文件内联） |
 | `src/login-page.js` | 单文件内联登录/设置页，暗色适配 |
 | `src/proxy.js` | 反向代理，Host 透传 + WebSocket 转发 |
 | `src/tls.js` | 调 openssl 生成自签证书，SAN 区分 IP/DNS |
+
+## 测试
+
+```bash
+node test/config-roundtrip.mjs   # 配置读写的往返与幂等
+node test/dsh-parses.mjs         # 让 DSH 亲自解析写出的配置
+node test/mock-upstream.mjs      # 用假上游验拉取模型列表
+node test/live-dsh.mjs           # 全链路：配好 → DSH 真发请求并收到回复
+```

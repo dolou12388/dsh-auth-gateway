@@ -25,13 +25,18 @@ import { homedir } from "node:os";
 import { CredentialStore, PASSWORD_POLICY } from "./credentials.js";
 import { SessionManager, COOKIE_NAME } from "./session.js";
 import { DshSessionSigner, cookieName as dshCookieName } from "./dsh-session.js";
+import { DshConfigWriter } from "./dsh-config.js";
 import { renderLoginPage, renderMessagePage, escapeHtml } from "./login-page.js";
+import { renderConfigPage } from "./config-page.js";
 import { UpstreamProxy } from "./proxy.js";
 import { ensureCertificate } from "./tls.js";
 
 const SESSION_MAX_AGE = 7 * 24 * 60 * 60;
 const LOGIN_PATH = "/__gateway/login";
 const LOGOUT_PATH = "/__gateway/logout";
+const CONFIG_PATH = "/__gateway/config";
+const MODELS_PATH = "/__gateway/models";
+const SAVE_CONFIG_PATH = "/__gateway/save-config";
 const MAX_BODY_BYTES = 8192;
 
 /** @type {ReturnType<typeof parseArgs>} */
@@ -49,6 +54,7 @@ try {
       "public-host": { type: "string" },
       "trust-proxy": { type: "boolean", default: false },
       "dsh-home": { type: "string" },
+      profile: { type: "string", default: "web" },
       "no-sso": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -80,6 +86,7 @@ if (opts.help) {
   --dsh-home <path>   DSH 主目录（默认 $DSH_HOME 或 ~/.dsh）
                       网关从中读取 cookie 签名密钥，登录后自动签一张
                       DSH 认的 cookie，免去在 DSH 页面二次登录
+  --profile <name>    要配置的 DSH profile（默认 web）
   --no-sso            关闭上面的自动签发（DSH 会要求再输一次 token）
   -h, --help          显示帮助
 
@@ -144,6 +151,8 @@ const proxy = new UpstreamProxy({ upstream: upstreamUrl, log });
  * 否则 DSH 会再拦一道「authentication required」。
  */
 const dshSigner = opts["no-sso"] ? undefined : new DshSessionSigner(dshHome, SESSION_MAX_AGE);
+/** 模型配置读写。 */
+const configWriter = new DshConfigWriter(dshHome, opts.profile ?? "web");
 
 /** 简单的失败计数，防在线爆破。键是客户端 IP。 */
 const failures = new Map();
@@ -332,8 +341,91 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ---- 模型配置页 ----
+  if (path === CONFIG_PATH) {
+    if (!sessions.verify(req)) {
+      await sendLoginPage(res, {
+        setupMode: !(await credentials.isInitialized()),
+        next: CONFIG_PATH,
+        status: 401,
+      });
+      return;
+    }
+    const cur = await configWriter.read().catch(() => ({ hasKey: false }));
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+    });
+    res.end(
+      renderConfigPage({
+        baseURL: cur.baseURL,
+        model: cur.model,
+        hasKey: cur.hasKey,
+        notice: typeof url.searchParams.get("notice") === "string" ? url.searchParams.get("notice") : undefined,
+        noticeIsError: url.searchParams.get("err") === "1",
+      }),
+    );
+    return;
+  }
+
+  // ---- 拉取模型列表 ----
+  if (path === MODELS_PATH) {
+    if (!sessions.verify(req)) return sendJson(res, 401, { error: "未登录" });
+    if (req.method !== "POST") return sendJson(res, 405, { error: "只支持 POST" });
+    const parsedBody = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+    if (parsedBody.__error !== undefined) return sendJson(res, 400, { error: parsedBody.__error });
+
+    const baseURL = String(parsedBody.baseURL ?? "").trim();
+    let apiKey = String(parsedBody.apiKey ?? "");
+    if (apiKey === "") {
+      // 页面允许留空表示「沿用已保存的 Key」
+      apiKey = await readSavedKey(configWriter).catch(() => "");
+      if (apiKey === "") return sendJson(res, 400, { error: "请填 API Key" });
+    }
+    try {
+      const models = await configWriter.listModels(baseURL, apiKey);
+      log(`拉取模型列表成功 数量=${models.length}`);
+      return sendJson(res, 200, { models });
+    } catch (err) {
+      log(`拉取模型列表失败: ${err.message}`);
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
+  // ---- 保存配置 ----
+  if (path === SAVE_CONFIG_PATH) {
+    if (!sessions.verify(req)) return sendJson(res, 401, { error: "未登录" });
+    if (req.method !== "POST") return sendJson(res, 405, { error: "只支持 POST" });
+    const parsedBody = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+    if (parsedBody.__error !== undefined) return sendJson(res, 400, { error: parsedBody.__error });
+
+    const baseURL = String(parsedBody.baseURL ?? "").trim();
+    let apiKey = String(parsedBody.apiKey ?? "");
+    const model = String(parsedBody.model ?? "").trim();
+    if (apiKey === "") {
+      apiKey = await readSavedKey(configWriter).catch(() => "");
+      if (apiKey === "") return sendJson(res, 400, { error: "请填 API Key" });
+    }
+    try {
+      await configWriter.save({ baseURL, apiKey, model });
+      log(`模型配置已保存 baseURL=${baseURL} model=${model}`);
+      return sendJson(res, 200, { ok: true });
+    } catch (err) {
+      log(`保存模型配置失败: ${err.message}`);
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
   // ---- 已登录则放行 ----
   if (sessions.verify(req)) {
+    // 首次进来且还没配模型 → 引导到配置页，否则用户进去只会看到一个不能对话的空壳
+    if (path === "/" && !(await hasUsableModel())) {
+      res.writeHead(303, { location: CONFIG_PATH, "cache-control": "no-store" });
+      res.end();
+      return;
+    }
     // 顺手补一张 DSH 的 cookie：用户可能清过浏览器数据，或网关刚重启过。
     // 只给页面请求补，静态资源不必每次都刷 Set-Cookie。
     const extra = path === "/" ? await maybeDshCookie(req) : undefined;
@@ -399,6 +491,83 @@ function hasCookie(header, name) {
     if (segment.slice(0, at).trim() === name) return true;
   }
   return false;
+}
+
+/**
+ * DSH 当前是否已经有可用的模型配置。
+ *
+ * 判断标准：provider 地址和 Key 都在，且有默认模型。三者缺一，
+ * 进去也聊不了，不如先把人引到配置页。
+ *
+ * @returns {Promise<boolean>}
+ */
+async function hasUsableModel() {
+  try {
+    const cur = await configWriter.read();
+    return (
+      typeof cur.baseURL === "string" &&
+      cur.baseURL !== "" &&
+      cur.hasKey &&
+      typeof cur.model === "string" &&
+      cur.model !== ""
+    );
+  } catch {
+    // 读不出来就别拦，让用户自己点进配置页
+    return true;
+  }
+}
+
+/**
+ * 输出 JSON 响应。
+ *
+ * @param {import("node:http").ServerResponse} res
+ * @param {number} status
+ * @param {object} body
+ */
+function sendJson(res, status, body) {
+  const text = JSON.stringify(body);
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": Buffer.byteLength(text),
+  });
+  res.end(text);
+}
+
+/**
+ * 读取 JSON 请求体（同样限长）。
+ *
+ * @param {import("node:http").IncomingMessage} req
+ * @returns {Promise<Record<string, unknown>>}
+ */
+async function readJsonBody(req) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > MAX_BODY_BYTES) throw new Error("请求体过大");
+    chunks.push(chunk);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (text.trim() === "") return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("请求体不是合法 JSON");
+  }
+  if (parsed === null || typeof parsed !== "object") throw new Error("请求体必须是对象");
+  return parsed;
+}
+
+/**
+ * 取已保存的 API Key（用于「留空表示不修改」）。
+ *
+ * @param {DshConfigWriter} writer
+ * @returns {Promise<string>}
+ */
+async function readSavedKey(writer) {
+  return (await writer.readKey()) ?? "";
 }
 
 /**
