@@ -1,0 +1,28 @@
+{
+  "name": "dsh-auth-gateway",
+  "version": "1.0.0",
+  "description": "为 DSH Web 提供首次登录设置密码的轻量认证网关（自签 HTTPS，单用户）",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "dsh-auth-gateway": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "gateway",
+    "auth",
+    "reverse-proxy"
+  ],
+  "license": "MIT"
+}

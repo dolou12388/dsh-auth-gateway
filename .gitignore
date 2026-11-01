@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.tmp/
+# 运行时产物：凭据、会话密钥、自签证书都不该进仓库
+credential.json
+session-secret
+cert.pem
+key.pem
