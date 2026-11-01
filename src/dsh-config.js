@@ -206,7 +206,7 @@ export class DshConfigWriter {
    * 把 Key 写进 credentials 的 refs 段。
    *
    * 保留文件里其它内容（尤其是 records 里的 browser-session 签名密钥，
-   * 它一care 丢用户就掉线）。所以这里按行改写，不做 YAML 重建。
+   * 它一旦丢用户就掉线）。所以这里按行改写，不做 YAML 重建。
    *
    * @param {string} refName
    * @param {string} value
@@ -566,18 +566,34 @@ function scalar(v) {
 /**
  * 在 credentials 文件里设置/更新一个 ref，保留其余内容。
  *
+ * 导出供 test/credentials-refs.mjs 直接验证，避免测试只能靠拉起整个
+ * DshConfigWriter（那样要真实 ~/.dsh，不是每台机器都跑得起来）。
+ *
  * @param {string} raw - 原文件文本（可能为空）
  * @param {string} refName
  * @param {string} value
  * @returns {string}
  */
-function upsertRefLine(raw, refName, value) {
+export function upsertRefLine(raw, refName, value) {
   if (raw.trim() === "") {
     return `version: 1\nrefs:\n  ${refName}: ${value}\n`;
   }
 
   const lines = raw.split(/\r?\n/);
-  const refsAt = lines.findIndex((l) => /^refs:\s*$/.test(l));
+  // 必须同时认块式（refs: 后无内容）和流式（refs: {} / refs: {...}）。
+  //
+  // 只认块式时，`refs: {}` 会被误判成「没有 refs 段」，转而在 version 后面
+  // 再插一个块式 refs —— 同一个文件出现两个 refs 键。YAML 解析器遇到重复
+  // 键不会挑一个，而是直接报 DUPLICATE_KEY，dsh 启动失败：
+  //
+  //   dsh: startup failed: 1 required plugin did not activate
+  //     credentials
+  //       Error: invalid document at ~/.dsh/.credentials.yaml:
+  //              DUPLICATE_KEY at line 4, column 1
+  //
+  // 下面 parseRefs 的正则本来就带 \{（读取侧是对的），这里与它对齐 ——
+  // 之前两边不一致，造成「读得懂、写就写坏」这种最别扭的不对称 bug。
+  const refsAt = lines.findIndex((l) => /^refs:\s*$/.test(l) || /^refs:\s*\{/.test(l));
 
   if (refsAt === -1) {
     // 没有 refs 段：插在 version 之后（或文件开头）
@@ -634,14 +650,49 @@ function upsertRefLine(raw, refName, value) {
 
 /**
  * 从 credentials 文件里读 refs 段。
+ *
+ * 支持三种写法：
+ *   refs:                    ← 块式
+ *     KEY: value
+ *
+ *   refs: {KEY: value}       ← 单行流式
+ *
+ *   refs:                    ← 多行流式
+ *     {
+ *       KEY: value,
+ *     }
+ *
+ * 单行流式曾经漏掉：正则命中 refsAt 后，循环从 refsAt 开始，第一行
+ * `refs: {KEY: value}` 因 l[1] === "refs" 被跳过；下一行 `records:` 不缩进，
+ * 立刻 break —— 结果返回空对象。upsertRefLine 的流式分支靠它取旧条目，
+ * 拿到空对象就把原 entries 全丢了（写回时只剩新 key）。
+ *
  * @param {string} raw
  * @returns {Record<string, string>}
  */
-function parseRefs(raw) {
+export function parseRefs(raw) {
   const out = {};
   const lines = raw.split(/\r?\n/);
   const refsAt = lines.findIndex((l) => /^refs:\s*$/.test(l) || /^refs:\s*\{/.test(l));
   if (refsAt === -1) return out;
+
+  /** 从一行里抠出所有 KEY: value 对。 */
+  const harvest = (text) => {
+    // 只取 { 与 } 之间的内容，避免把 `refs` 本身当成 key
+    const inner = text.replace(/^refs:\s*/, "");
+    const body = inner.replace(/^\{/, "").replace(/\}\s*$/, "");
+    for (const piece of body.split(",")) {
+      const m = /([A-Za-z_][A-Za-z0-9_]*):\s*([^,}\s]+)/.exec(piece);
+      if (m !== null) out[m[1]] = m[2];
+    }
+  };
+
+  // 单行流式：整个段就一行
+  if (/^refs:\s*\{.*\}/.test(lines[refsAt])) {
+    harvest(lines[refsAt]);
+    return out;
+  }
+
   for (let i = refsAt; i < lines.length; i += 1) {
     const l = lines[i];
     if (i > refsAt && l.trim() !== "" && !/^\s/.test(l)) break;

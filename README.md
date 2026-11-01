@@ -228,4 +228,40 @@ node test/config-roundtrip.mjs   # 配置读写的往返与幂等
 node test/dsh-parses.mjs         # 让 DSH 亲自解析写出的配置
 node test/mock-upstream.mjs      # 用假上游验拉取模型列表
 node test/live-dsh.mjs           # 全链路：配好 → DSH 真发请求并收到回复
+node test/credentials-refs.mjs   # credentials refs 段写入回归（不依赖 ~/.dsh）
 ```
+
+前四个里的 `dsh-parses` 与 `live-dsh` 需要本机有可用的 `dsh` 和已配置的
+`~/.dsh`；`credentials-refs` 只测纯函数，任何机器都能跑。
+
+### `credentials-refs` 守的是什么
+
+`upsertRefLine` 原先只用 `/^refs:\s*$/` 找 refs 段，遇到流式写法
+`refs: {}` 会误判成「没有 refs 段」，于是在 `version` 后面再插一个块式
+`refs` —— 同一个文件出现两个 `refs` 键。YAML 解析器遇到重复键不挑一个，
+直接报错，**整个 DSH 起不来**：
+
+```
+dsh: startup failed: 1 required plugin did not activate
+  credentials
+    Error: invalid document at ~/.dsh/.credentials.yaml:
+           DUPLICATE_KEY at line 4, column 1
+```
+
+这个坑隐蔽在三处叠加：
+
+1. 只在**流式**写法下触发，块式一直正常；
+2. 读取侧 `parseRefs` 的正则本来就带 `\{`，所以「读」永远没问题，只有
+   「写」会写坏 —— 典型的「读得懂、写就写坏」不对称 bug；
+3. 写坏后**当前进程不受影响**，要等下次重启才爆发。现场那次潜伏了
+   3 小时 45 分钟，而且用户看到的现象是「装了插件但左侧没入口」，很容易
+   误判成插件问题。
+
+修了两处，都在 `src/dsh-config.js`：
+
+- `upsertRefLine` 的 `refsAt` 正则补上 `| ^refs:\s*\{`，与读取侧对齐；
+- `parseRefs` 增加单行流式分支。原先循环从 `refsAt` 开始，首行
+  `refs: {KEY: value}` 因 key 等于 `refs` 被跳过，下一行 `records:` 不缩进
+  立刻 `break`，返回空对象；`upsertRefLine` 的流式分支靠它取旧条目，拿到
+  空对象就把原有 entries 全丢了。
+
